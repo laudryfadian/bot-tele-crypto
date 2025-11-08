@@ -1,15 +1,105 @@
 const { sendTelegram } = require("./notifier");
 
-const candleHistory = {}; // Menyimpan beberapa candle untuk analisis lebih baik
+const candleHistory = {}; // Menyimpan candle untuk analisis teknikal
 const lastSignalTime = {}; // Track waktu signal terakhir untuk cooldown
 const signalQueue = []; // Queue untuk menyimpan signal dan ranking
 
 const PRICE_CHANGE_THRESHOLD = parseFloat(process.env.PRICE_CHANGE_THRESHOLD || 3);
 const VOLUME_CHANGE_THRESHOLD = parseFloat(process.env.VOLUME_CHANGE_THRESHOLD || 100);
-const HISTORY_LENGTH = 5;
-const SIGNAL_COOLDOWN = parseInt(process.env.SIGNAL_COOLDOWN_MINUTES || 30) * 60 * 1000; // Default 30 menit
-const MIN_SIGNAL_SCORE = parseFloat(process.env.MIN_SIGNAL_SCORE || 70); // Score minimum untuk notifikasi
-const MAX_SIGNALS_PER_HOUR = parseInt(process.env.MAX_SIGNALS_PER_HOUR || 5); // Maksimal 5 signal per jam
+const HISTORY_LENGTH = 20; // Butuh lebih banyak data untuk indikator teknikal
+const SIGNAL_COOLDOWN = parseInt(process.env.SIGNAL_COOLDOWN_MINUTES || 30) * 60 * 1000;
+const MIN_SIGNAL_SCORE = parseFloat(process.env.MIN_SIGNAL_SCORE || 70);
+const MAX_SIGNALS_PER_HOUR = parseInt(process.env.MAX_SIGNALS_PER_HOUR || 5);
+
+// ============ TECHNICAL INDICATORS ============
+
+// Calculate RSI (Relative Strength Index)
+function calculateRSI(candles, period = 14) {
+  if (candles.length < period + 1) return null;
+
+  let gains = 0;
+  let losses = 0;
+
+  // Calculate initial average gain/loss
+  for (let i = candles.length - period; i < candles.length; i++) {
+    const change = candles[i].close - candles[i - 1].close;
+    if (change > 0) gains += change;
+    else losses += Math.abs(change);
+  }
+
+  const avgGain = gains / period;
+  const avgLoss = losses / period;
+
+  if (avgLoss === 0) return 100;
+
+  const rs = avgGain / avgLoss;
+  const rsi = 100 - 100 / (1 + rs);
+
+  return rsi;
+}
+
+// Calculate EMA (Exponential Moving Average)
+function calculateEMA(candles, period) {
+  if (candles.length < period) return null;
+
+  const multiplier = 2 / (period + 1);
+  const prices = candles.map((c) => c.close);
+
+  // Start with SMA
+  let ema = prices.slice(-period).reduce((a, b) => a + b, 0) / period;
+
+  // Calculate EMA
+  for (let i = candles.length - period + 1; i < candles.length; i++) {
+    ema = (prices[i] - ema) * multiplier + ema;
+  }
+
+  return ema;
+}
+
+// Calculate MACD (Moving Average Convergence Divergence)
+function calculateMACD(candles) {
+  const ema12 = calculateEMA(candles, 12);
+  const ema26 = calculateEMA(candles, 26);
+
+  if (!ema12 || !ema26) return null;
+
+  const macdLine = ema12 - ema26;
+  // Simplified: return MACD line only (signal line requires more history)
+
+  return { macdLine, ema12, ema26 };
+}
+
+// Calculate Bollinger Bands
+function calculateBollingerBands(candles, period = 20, stdDev = 2) {
+  if (candles.length < period) return null;
+
+  const prices = candles.slice(-period).map((c) => c.close);
+  const sma = prices.reduce((a, b) => a + b, 0) / period;
+
+  // Calculate standard deviation
+  const squaredDiffs = prices.map((p) => Math.pow(p - sma, 2));
+  const variance = squaredDiffs.reduce((a, b) => a + b, 0) / period;
+  const std = Math.sqrt(variance);
+
+  return {
+    upper: sma + std * stdDev,
+    middle: sma,
+    lower: sma - std * stdDev,
+  };
+}
+
+// Detect Support and Resistance levels
+function detectSupportResistance(candles) {
+  if (candles.length < 5) return null;
+
+  const lows = candles.map((c) => c.low);
+  const highs = candles.map((c) => c.high);
+
+  const support = Math.min(...lows.slice(-5));
+  const resistance = Math.max(...highs.slice(-5));
+
+  return { support, resistance };
+}
 
 function processMarketData(data) {
   // Data dari kline stream
@@ -56,63 +146,146 @@ function processMarketData(data) {
     candleHistory[symbol].shift();
   }
 
-  // Butuh minimal 2 candle untuk analisis
-  if (candleHistory[symbol].length < 2) {
+  // Butuh minimal 15 candle untuk analisis teknikal
+  if (candleHistory[symbol].length < 15) {
     return;
   }
 
   const prevCandle = candleHistory[symbol][candleHistory[symbol].length - 2];
   const currentCandleData = candleHistory[symbol][candleHistory[symbol].length - 1];
 
-  // Hitung perubahan harga
+  // ============ BASIC METRICS ============
   const priceChange = ((currentCandleData.close - prevCandle.close) / prevCandle.close) * 100;
 
-  // Hitung rata-rata volume dari candle sebelumnya (kecuali candle terakhir)
   const volumeHistory = candleHistory[symbol].slice(0, -1).map((c) => c.volume);
   const avgVolume = volumeHistory.reduce((a, b) => a + b, 0) / volumeHistory.length;
-
-  // Hitung volume spike (perbandingan dengan rata-rata)
   const volumeSpike = ((currentCandleData.volume - avgVolume) / avgVolume) * 100;
 
-  // Deteksi pola candlestick
   const bodySize = Math.abs(currentCandleData.close - currentCandleData.open);
   const totalRange = currentCandleData.high - currentCandleData.low;
   const bodyRatio = totalRange > 0 ? (bodySize / totalRange) * 100 : 0;
-
   const isBullish = currentCandleData.close > currentCandleData.open;
-  const isStrongCandle = bodyRatio > 60; // Body lebih dari 60% dari total range
+  const isStrongCandle = bodyRatio > 60;
 
-  // Check cooldown - jangan spam signal dari coin yang sama
+  // ============ TECHNICAL INDICATORS ============
+  const rsi = calculateRSI(candleHistory[symbol]);
+  const ema12 = calculateEMA(candleHistory[symbol], 12);
+  const ema26 = calculateEMA(candleHistory[symbol], 26);
+  const macd = calculateMACD(candleHistory[symbol]);
+  const bollinger = calculateBollingerBands(candleHistory[symbol]);
+  const srLevels = detectSupportResistance(candleHistory[symbol]);
+
+  // Check cooldown
   const now = Date.now();
   if (lastSignalTime[symbol] && now - lastSignalTime[symbol] < SIGNAL_COOLDOWN) {
-    return; // Skip, masih dalam cooldown period
+    return;
   }
 
-  // Hitung signal score (0-100) untuk ranking
+  // ============ ADVANCED SIGNAL DETECTION ============
   let signalScore = 0;
   let signalType = null;
+  let signals = []; // Track which conditions are met
 
-  // BUY SIGNAL: Harga naik kuat + Volume spike + Strong bullish candle
-  if (priceChange >= PRICE_CHANGE_THRESHOLD && volumeSpike >= VOLUME_CHANGE_THRESHOLD && isBullish && isStrongCandle) {
+  // === STRONG BUY CONDITIONS ===
+  const buyConditions = {
+    priceBreakout: priceChange >= PRICE_CHANGE_THRESHOLD,
+    volumeSpike: volumeSpike >= VOLUME_CHANGE_THRESHOLD,
+    bullishCandle: isBullish && isStrongCandle,
+    rsiOversold: rsi && rsi < 30, // RSI oversold (reversal potential)
+    rsiModerate: rsi && rsi >= 30 && rsi < 50, // RSI not overbought
+    emaBullish: ema12 && ema26 && ema12 > ema26, // EMA crossover bullish
+    macdBullish: macd && macd.macdLine > 0,
+    bollingerBounce: bollinger && currentCandleData.close <= bollinger.lower, // Price at lower band
+    nearSupport: srLevels && currentCandleData.close <= srLevels.support * 1.02, // Near support level
+  };
+
+  // === STRONG SELL CONDITIONS ===
+  const sellConditions = {
+    priceBreakdown: priceChange <= -PRICE_CHANGE_THRESHOLD,
+    volumeSpike: volumeSpike >= VOLUME_CHANGE_THRESHOLD,
+    bearishCandle: !isBullish && isStrongCandle,
+    rsiOverbought: rsi && rsi > 70, // RSI overbought (reversal potential)
+    rsiModerate: rsi && rsi <= 70 && rsi > 50,
+    emaBearish: ema12 && ema26 && ema12 < ema26, // EMA crossover bearish
+    macdBearish: macd && macd.macdLine < 0,
+    bollingerReject: bollinger && currentCandleData.close >= bollinger.upper, // Price at upper band
+    nearResistance: srLevels && currentCandleData.close >= srLevels.resistance * 0.98, // Near resistance
+  };
+
+  // Calculate BUY score
+  if (buyConditions.priceBreakout && buyConditions.volumeSpike && buyConditions.bullishCandle) {
     signalType = "BUY";
-    // Score berdasarkan kekuatan signal
-    signalScore += Math.min(priceChange * 5, 40); // Max 40 points dari price change
-    signalScore += Math.min(volumeSpike / 5, 30); // Max 30 points dari volume spike
-    signalScore += Math.min(bodyRatio / 2, 30); // Max 30 points dari candle strength
+
+    // Base score from price action
+    signalScore += Math.min(priceChange * 4, 25);
+    signalScore += Math.min(volumeSpike / 6, 20);
+    signalScore += Math.min(bodyRatio / 3, 15);
+
+    // Bonus from technical indicators
+    if (buyConditions.rsiOversold) {
+      signalScore += 15; // Strong reversal signal
+      signals.push("RSI Oversold");
+    } else if (buyConditions.rsiModerate) {
+      signalScore += 8;
+      signals.push("RSI Moderate");
+    }
+
+    if (buyConditions.emaBullish) {
+      signalScore += 10;
+      signals.push("EMA Bullish Cross");
+    }
+
+    if (buyConditions.macdBullish) {
+      signalScore += 8;
+      signals.push("MACD Positive");
+    }
+
+    if (buyConditions.bollingerBounce) {
+      signalScore += 12; // Bounce from lower band
+      signals.push("Bollinger Bounce");
+    }
+
+    if (buyConditions.nearSupport) {
+      signalScore += 7;
+      signals.push("Near Support");
+    }
   }
 
-  // SELL SIGNAL: Harga turun drastis + Volume spike + Strong bearish candle
-  else if (priceChange <= -PRICE_CHANGE_THRESHOLD && volumeSpike >= VOLUME_CHANGE_THRESHOLD && !isBullish && isStrongCandle) {
+  // Calculate SELL score
+  else if (sellConditions.priceBreakdown && sellConditions.volumeSpike && sellConditions.bearishCandle) {
     signalType = "SELL";
-    signalScore += Math.min(Math.abs(priceChange) * 5, 40);
-    signalScore += Math.min(volumeSpike / 5, 30);
-    signalScore += Math.min(bodyRatio / 2, 30);
-  }
 
-  // WARNING: Volume spike tanpa price movement yang signifikan
-  else if (volumeSpike >= VOLUME_CHANGE_THRESHOLD * 1.5 && Math.abs(priceChange) < PRICE_CHANGE_THRESHOLD) {
-    signalType = "VOLUME_ALERT";
-    signalScore += Math.min(volumeSpike / 10, 50); // Volume alert dapat max 50 points
+    signalScore += Math.min(Math.abs(priceChange) * 4, 25);
+    signalScore += Math.min(volumeSpike / 6, 20);
+    signalScore += Math.min(bodyRatio / 3, 15);
+
+    if (sellConditions.rsiOverbought) {
+      signalScore += 15;
+      signals.push("RSI Overbought");
+    } else if (sellConditions.rsiModerate) {
+      signalScore += 8;
+      signals.push("RSI Moderate");
+    }
+
+    if (sellConditions.emaBearish) {
+      signalScore += 10;
+      signals.push("EMA Bearish Cross");
+    }
+
+    if (sellConditions.macdBearish) {
+      signalScore += 8;
+      signals.push("MACD Negative");
+    }
+
+    if (sellConditions.bollingerReject) {
+      signalScore += 12;
+      signals.push("Bollinger Rejection");
+    }
+
+    if (sellConditions.nearResistance) {
+      signalScore += 7;
+      signals.push("Near Resistance");
+    }
   }
 
   // Jika tidak ada signal atau score terlalu rendah, skip
@@ -142,9 +315,9 @@ function processMarketData(data) {
     signalQueue.shift();
   }
 
-  console.log(`[${symbol}] 🎯 SIGNAL TRIGGERED | Type: ${signalType} | Score: ${signalScore.toFixed(0)}/100`);
+  console.log(`[${symbol}] 🎯 SIGNAL TRIGGERED | Type: ${signalType} | Score: ${signalScore.toFixed(0)}/100 | Signals: ${signals.join(", ")}`);
 
-  // Kirim notifikasi berdasarkan tipe signal
+  // Kirim notifikasi dengan technical indicators
   if (signalType === "BUY") {
     const scoreEmoji = signalScore >= 90 ? "🔥🔥🔥" : signalScore >= 80 ? "🔥🔥" : "🔥";
     sendTelegram(`🚀 STRONG BUY SIGNAL ${scoreEmoji}
@@ -155,8 +328,7 @@ Timeframe: ${data.k.i}
 
 📈 Price Action:
    Change: +${priceChange.toFixed(2)}%
-   Open: $${openPrice}
-   Close: $${closePrice}
+   Current: $${closePrice}
    High: $${highPrice}
    Low: $${lowPrice}
 
@@ -165,9 +337,19 @@ Timeframe: ${data.k.i}
    Current: ${volume.toFixed(2)}
    Avg: ${avgVolume.toFixed(2)}
 
-🕯️ Candle Strength: ${bodyRatio.toFixed(0)}%
+� Technical Indicators:
+   RSI: ${rsi ? rsi.toFixed(1) : "N/A"} ${rsi && rsi < 30 ? "🟢 OVERSOLD" : rsi && rsi < 50 ? "🟡" : "🔴"}
+   EMA12: $${ema12 ? ema12.toFixed(8) : "N/A"}
+   EMA26: $${ema26 ? ema26.toFixed(8) : "N/A"}
+   MACD: ${macd ? macd.macdLine.toFixed(4) : "N/A"} ${macd && macd.macdLine > 0 ? "🟢" : "🔴"}
+   BB Upper: $${bollinger ? bollinger.upper.toFixed(8) : "N/A"}
+   BB Lower: $${bollinger ? bollinger.lower.toFixed(8) : "N/A"}
+
+✅ Confirmed Signals:
+   ${signals.join("\n   ")}
+
 ⏰ Time: ${new Date().toLocaleString()}
-📊 Signals in last hour: ${recentSignals.length + 1}/${MAX_SIGNALS_PER_HOUR}`);
+📊 Signals: ${recentSignals.length + 1}/${MAX_SIGNALS_PER_HOUR}/hour`);
   } else if (signalType === "SELL") {
     const scoreEmoji = signalScore >= 90 ? "🔥🔥🔥" : signalScore >= 80 ? "🔥🔥" : "🔥";
     sendTelegram(`⚠️ STRONG SELL SIGNAL ${scoreEmoji}
@@ -178,8 +360,7 @@ Timeframe: ${data.k.i}
 
 📉 Price Action:
    Change: ${priceChange.toFixed(2)}%
-   Open: $${openPrice}
-   Close: $${closePrice}
+   Current: $${closePrice}
    High: $${highPrice}
    Low: $${lowPrice}
 
@@ -188,20 +369,19 @@ Timeframe: ${data.k.i}
    Current: ${volume.toFixed(2)}
    Avg: ${avgVolume.toFixed(2)}
 
-🕯️ Candle Strength: ${bodyRatio.toFixed(0)}%
-⏰ Time: ${new Date().toLocaleString()}
-📊 Signals in last hour: ${recentSignals.length + 1}/${MAX_SIGNALS_PER_HOUR}`);
-  } else if (signalType === "VOLUME_ALERT") {
-    sendTelegram(`⚡ HIGH VOLUME ALERT
-━━━━━━━━━━━━━━━━━━
-Pair: ${symbol}
-💯 Signal Score: ${signalScore.toFixed(0)}/100
-Volume Spike: +${volumeSpike.toFixed(0)}%
-Price Change: ${priceChange.toFixed(2)}%
-Current Price: $${closePrice}
+� Technical Indicators:
+   RSI: ${rsi ? rsi.toFixed(1) : "N/A"} ${rsi && rsi > 70 ? "🔴 OVERBOUGHT" : rsi && rsi > 50 ? "🟡" : "🟢"}
+   EMA12: $${ema12 ? ema12.toFixed(8) : "N/A"}
+   EMA26: $${ema26 ? ema26.toFixed(8) : "N/A"}
+   MACD: ${macd ? macd.macdLine.toFixed(4) : "N/A"} ${macd && macd.macdLine < 0 ? "🔴" : "🟢"}
+   BB Upper: $${bollinger ? bollinger.upper.toFixed(8) : "N/A"}
+   BB Lower: $${bollinger ? bollinger.lower.toFixed(8) : "N/A"}
 
-⚠️ High volatility detected - Watch closely!
-⏰ Time: ${new Date().toLocaleString()}`);
+⚠️ Confirmed Signals:
+   ${signals.join("\n   ")}
+
+⏰ Time: ${new Date().toLocaleString()}
+📊 Signals: ${recentSignals.length + 1}/${MAX_SIGNALS_PER_HOUR}/hour`);
   }
 }
 
